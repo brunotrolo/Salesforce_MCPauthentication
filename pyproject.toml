@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sf-mcp-auth"
+version = "1.1.1"
+description = "OAuth2 client + bootstrap for Salesforce Hosted MCP servers with automatic refresh token rotation, plus GitHub App token minting (PAT-free secrets rotation)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["salesforce", "mcp", "oauth2", "refresh-token-rotation"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.scripts]
+sf-mcp-auth-bootstrap = "sf_mcp_auth.bootstrap:main"
+
+[project.optional-dependencies]
+# Used to mint GitHub App installation tokens and kill the long-lived PAT.
+# Kept optional so the core package stays stdlib-only.
+github-app = ["pyjwt[crypto]>=2.8"]
+# Dev dependency: only needed to run the test suite.
+test = [
+    "pytest>=7",
+    "pyjwt[crypto]>=2.8",  # for tests/test_github_app_token.py
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

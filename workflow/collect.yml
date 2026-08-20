@@ -1,0 +1,249 @@
+# =============================================================================
+# Reference workflow: Salesforce MCP collect with automatic secret rotation
+# (verbatim from the production project; adapt paths/step names to yours)
+#
+# What to adapt in YOUR project:
+#   - "Install dependencies": install YOUR packages instead of services/*
+#   - "Run pipeline": point to YOUR script (here: monitoring/orchestrate.py)
+#     and KEEP the --auth-state-out out/auth_state.json argument - it is the
+#     contract with the rotation step
+#   - Remove "Persist snapshot to data branch" / "Upload snapshot artifact"
+#     if you do not keep a data branch
+#   - Secrets used: SF_CLIENT_ID, SF_CLIENT_SECRET, SF_REFRESH_TOKEN,
+#     SALESFORCE_MCP_URL, plus the GitHub App pair (APP_ID, APP_PRIVATE_KEY) -
+#     the action resolves the installation itself via the owner, no
+#     installation-id input needed.
+#
+# The key trick is the "Rotate auth secret" step: it runs with `if: always()`
+# so even a failing pipeline still hands the ROTATED refresh token back to
+# the secret - the next run always starts with a live token.
+#
+# Two production lessons baked into this template:
+#   1. The rotate step compares refresh_token vs refresh_token_initial (written
+#      by pipeline/auth_state.py). A run that never refreshed must NOT write the
+#      secret back - otherwise a failed concurrent run can clobber a valid
+#      rotated token with an already-dead one (seen in production on 2026-08-19).
+#   2. The concurrency group ensures only ONE collect runs at a time - two
+#      overlapping runs both refresh and rotate the token, and the loser writes
+#      a dead token back over the winner's fresh one.
+#
+# PAT-free architecture (added 2026-08-19): the long-lived PAT was the weak
+# link of the rotation loop - it never expires, leaks once and is reusable
+# forever, and GitHub refuses to rotate it via API. The GitHub App fixes that:
+# the Workflow mints an installation token of 1 hour every run via
+# actions/create-github-app-token@v1, scoped to Actions: read/write only.
+# Setup once; never touch it again.
+# =============================================================================
+
+name: Collect
+
+on:
+  schedule:
+    # Every 5 minutes (24/7 data collection).
+    # GitHub schedules are not guaranteed to fire exactly on time and can
+    # skip runs under load; 5 min is the shortest reliable cadence. The
+    # second entry (offset by 2 min) is a workaround for GitHub's cron
+    # coalescing: when the scheduler merges a window, an offset entry
+    # roughly doubles the chance that one of the two fires. Observed
+    # reality (production, 2026-08-18/19): effective intervals of 25-40 min
+    # with a worst-case 89 min gap, all runs succeeding - the delay is the
+    # scheduler, not the pipeline.
+    - cron: "*/5 * * * *"
+    - cron: "2-59/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    # secrets context is not allowed in step `if:` - expose via job env
+    # (the standard workaround) so the mint step can check presence.
+    env:
+      GH_APP_ID: ${{ secrets.APP_ID }}
+      GH_APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install dependencies
+        run: |
+          for d in services/*/; do
+            pip install -r "$d/requirements.txt"
+            pip install -e "$d"
+          done
+          pip install -r monitoring/requirements.txt
+
+      # PAT-free rotation: mint a 1-hour installation token from the GitHub App.
+      # Skipped while the App is not configured (the rotate step then skips too).
+      # The action resolves the installation itself via the owner - no
+      # installation-id input needed.
+      - name: Mint GitHub App token (PAT-free rotation)
+        id: app_token
+        if: ${{ env.GH_APP_ID != '' && env.GH_APP_PRIVATE_KEY != '' }}
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          # Scoped to this repo - the App cannot do anything else.
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Compute stamp
+        id: stamp
+        run: |
+          echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          echo "stamp=$(date -u +%Y-%m-%dT%H-%M-%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch previous snapshot (recurrence history)
+        id: history
+        run: |
+          set -e
+          git fetch origin data 2>/dev/null || { echo "no previous snapshot (first run)"; exit 0; }
+          git worktree add data-branch origin/data
+          LATEST=$(cd data-branch && find data -name '*.json' -type f | sort | tail -n 1)
+          if [ -n "$LATEST" ]; then
+            mkdir -p out
+            cp "data-branch/${LATEST}" out/previous.json
+            echo "history-file=out/previous.json" >> "$GITHUB_OUTPUT"
+            echo "Using previous snapshot: ${LATEST}"
+          else
+            echo "No previous snapshot found (first run)"
+          fi
+          if [ -f "data-branch/feedback.json" ]; then
+            mkdir -p out
+            cp "data-branch/feedback.json" out/feedback.json
+            echo "feedback-file=out/feedback.json" >> "$GITHUB_OUTPUT"
+            echo "Using feedback file: feedback.json (branch data)"
+          else
+            echo "No feedback file found on branch data"
+          fi
+          if [ -f "data-branch/calibration.json" ]; then
+            mkdir -p out
+            cp "data-branch/calibration.json" out/calibration.json
+            echo "calibration-file=out/calibration.json" >> "$GITHUB_OUTPUT"
+            echo "Using calibration samples: calibration.json (branch data)"
+          else
+            echo "No calibration file found on branch data (auto-calibration starts empty)"
+          fi
+          git worktree remove data-branch --force 2>/dev/null || true
+
+      - name: Run pipeline (real MCP mode)
+        id: pipeline
+        env:
+          SALESFORCE_MCP_URL: ${{ secrets.SALESFORCE_MCP_URL }}
+          SF_CLIENT_ID: ${{ secrets.SF_CLIENT_ID }}
+          SF_CLIENT_SECRET: ${{ secrets.SF_CLIENT_SECRET }}
+          SF_REFRESH_TOKEN: ${{ secrets.SF_REFRESH_TOKEN }}
+        run: |
+          mkdir -p out
+          HISTORY=""
+          if [ -n "${{ steps.history.outputs.history-file }}" ]; then
+            HISTORY="--history-file ${{ steps.history.outputs.history-file }}"
+          fi
+          FEEDBACK=""
+          if [ -n "${{ steps.history.outputs.feedback-file }}" ]; then
+            FEEDBACK="--feedback-file ${{ steps.history.outputs.feedback-file }}"
+          fi
+          SAMPLES=""
+          if [ -n "${{ steps.history.outputs.calibration-file }}" ]; then
+            SAMPLES="--samples-file ${{ steps.history.outputs.calibration-file }}"
+          fi
+          python monitoring/orchestrate.py --mode real \
+            --log-file "out/${{ steps.stamp.outputs.stamp }}.json" \
+            --metrics-file "out/${{ steps.stamp.outputs.stamp }}.prom" \
+            --auth-state-out "out/auth_state.json" \
+            ${HISTORY} ${FEEDBACK} ${SAMPLES}
+
+      - name: Rotate auth secret (refresh token rotation)
+        # Salesforce rotates the refresh token on every refresh (mandatory in
+        # this org). The pipeline persists the latest token to out/auth_state.json;
+        # this step writes it back to the SF_REFRESH_TOKEN secret so the next run
+        # always starts with the current token.
+        #
+        # Auth to the Secrets API uses the GitHub App installation token
+        # minted above (1h, PAT-free) - the only way in this setup.
+        if: always() && steps.stamp.outputs.stamp != ''
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          set -e
+          if [ -z "$GH_TOKEN" ]; then
+            echo "No GitHub App token - skipping secret rotation"
+            echo "Configure the GitHub App (README section 3)."
+            exit 0
+          fi
+          if [ ! -f "out/auth_state.json" ]; then
+            echo "No auth_state.json - nothing to rotate"
+            exit 0
+          fi
+          NEW_TOKEN=$(python -c "import json;print(json.load(open('out/auth_state.json'))['refresh_token'])")
+          if [ -z "$NEW_TOKEN" ]; then
+            echo "Empty refresh token in auth_state.json - skipping"
+            exit 0
+          fi
+          OLD_TOKEN=$(python -c "import json;print(json.load(open('out/auth_state.json')).get('refresh_token_initial',''))")
+          if [ -z "$OLD_TOKEN" ]; then
+            echo "No refresh_token_initial in auth_state.json - cannot verify rotation, skipping"
+            exit 0
+          fi
+          if [ "$NEW_TOKEN" = "$OLD_TOKEN" ]; then
+            echo "Token was NOT rotated this run - skipping secret write (avoids clobbering a valid token with a dead one)"
+            exit 0
+          fi
+          gh secret set SF_REFRESH_TOKEN --body "$NEW_TOKEN"
+          echo "SF_REFRESH_TOKEN rotated"
+
+      - name: Persist snapshot to data branch
+        # git worktree add origin/data is a DETACHED HEAD - always push with
+        # `git push origin HEAD:data`, never `git push origin data`.
+        if: always() && steps.stamp.outputs.stamp != ''
+        run: |
+          set -e
+          DATE="${{ steps.stamp.outputs.date }}"
+          STAMP="${{ steps.stamp.outputs.stamp }}"
+          [ ! -f "out/${STAMP}.json" ] && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin data 2>/dev/null || true
+          if git rev-parse --verify origin/data >/dev/null 2>&1; then
+            git worktree add data-branch origin/data
+          else
+            git worktree add data-branch -b data
+          fi
+          cd data-branch
+          mkdir -p "data/${DATE}"
+          cp "../out/${STAMP}.json" "data/${DATE}/${STAMP}.json"
+          if [ -f "../out/${STAMP}.prom" ]; then
+            cp "../out/${STAMP}.prom" "data/${DATE}/${STAMP}.prom"
+          fi
+          if [ -f "../out/calibration.json" ]; then
+            cp "../out/calibration.json" calibration.json
+          fi
+          git add "data/${DATE}/"
+          if [ -f "calibration.json" ]; then
+            git add calibration.json
+          fi
+          git commit -m "data: ${STAMP}" || { echo "No changes"; exit 0; }
+          git push origin HEAD:data
+          cd ..
+          git worktree remove data-branch --force 2>/dev/null || true
+
+      - name: Upload snapshot artifact
+        if: always() && steps.stamp.outputs.stamp != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stamp.outputs.stamp }}
+          path: |
+            out/${{ steps.stamp.outputs.stamp }}.json
+            out/${{ steps.stamp.outputs.stamp }}.prom
+          if-no-files-found: warn
+          retention-days: 7
